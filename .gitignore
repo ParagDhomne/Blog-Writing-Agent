@@ -1,4 +1,8 @@
+# Secrets
 /.env
+
+# Environment
 /.venv
 
-/outputs
+# OupPuts
+/output
