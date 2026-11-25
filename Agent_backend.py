@@ -4,6 +4,7 @@ import operator
 from typing import TypedDict, Annotated, Literal, Optional
 from pathlib import Path
 import re
+from datetime import date, timedelta
 
 from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, START, END
@@ -66,6 +67,20 @@ class RouterDecision(BaseModel):
 class EvidencePack(BaseModel):
     evidence: list[EvidenceItem] = Field(default_factory=list)
 
+class ImageSpec(BaseModel):
+    placeholder: str = Field(..., description="e.g. [[IMAGE_1]]")
+    filename: str = Field(..., description="Save under images/, e.g. qkv_flow.png")
+    alt: str
+    caption: str
+    prompt: str = Field(..., description="Prompt to send to the image model.")
+    size: Literal["1024x1024", "1024x1536", "1536x1024"] = "1024x1024"
+    quality: Literal["low", "medium", "high"] = "medium"
+
+
+class GlobalImagePlan(BaseModel):
+    md_with_placeholders: str
+    images: list[ImageSpec] = Field(default_factory=list)
+
 #-----------------------------------------------[States]-----------------------------------------------------
 
 class State(TypedDict):
@@ -80,6 +95,12 @@ class State(TypedDict):
 
     # workers
     sections: Annotated[list[tuple[int, str]], operator.add]  # (task_id, section_md)
+
+    # reducer/image
+    merged_md: str
+    md_with_placeholders: str
+    image_specs: list[dict]
+
     final: str
 #---------------------------------------------[LLM Models]------------------------------------------------------
 llm = ChatOpenAI(model='gpt-4.1-mini')
@@ -341,8 +362,16 @@ def worker_node(payload: dict) -> dict:
 
     return {"sections": [(task.id, section_md)]}
 
-#----------------------------------------------------[  8) Reducer (merge + save) ]----------------------------------------------------
-def reducer_node(state: State) -> dict:
+#----------------------[  8) Reducer with Image( merge content -> decide image ->generate and place images ) ]----------------------------------------------------
+import base64
+import re
+from pathlib import Path
+
+from openai import OpenAI
+from langchain_core.messages import HumanMessage, SystemMessage
+
+
+def merge_content(state: State) -> dict:
     plan = state["plan"]
 
     ordered_sections = [
@@ -350,31 +379,149 @@ def reducer_node(state: State) -> dict:
         for _, markdown in sorted(state["sections"], key=lambda item: item[0])
     ]
     body = "\n\n".join(ordered_sections).strip()
-    final_md = f"# {plan.blog_title}\n\n{body}\n"
+    return {"merged_md": f"# {plan.blog_title}\n\n{body}\n"}
+
+
+DECIDE_IMAGES_SYSTEM = """
+You are an expert technical editor.
+Decide whether up to 3 images would materially improve this blog.
+Prefer useful technical diagrams over decorative images.
+Insert each image's placeholder exactly where it belongs.
+If no images are needed, return the original Markdown unchanged and images=[].
+Return a response matching the GlobalImagePlan schema.
+"""
+
+
+def decide_images(state: State) -> dict:
+    plan = state["plan"]
+    image_plan = llm.with_structured_output(GlobalImagePlan).invoke(
+        [
+            SystemMessage(content=DECIDE_IMAGES_SYSTEM),
+            HumanMessage(
+                content=(
+                    f"Blog title: {plan.blog_title}\n"
+                    f"Topic: {state['topic']}\n\n"
+                    f"{state['merged_md']}"
+                )
+            ),
+        ]
+    )
+
+    return {
+        "md_with_placeholders": image_plan.md_with_placeholders,
+        "image_specs": [
+            image.model_dump() for image in image_plan.images[:3]
+        ],
+    }
+
+
+def _openai_generate_image_bytes(spec: dict) -> bytes:
+    client = OpenAI()  # Reads OPENAI_API_KEY from the environment.
+    response = client.images.generate(
+        model="gpt-image-2.6-sunburst",
+        prompt=spec["prompt"],
+        size=spec.get("size", "1024x1024"),
+        quality=spec.get("quality", "medium"),
+    )
+
+    encoded = response.data[0].b64_json
+    if not encoded:
+        raise RuntimeError("OpenAI returned no image data.")
+
+    return base64.b64decode(encoded)
+
+
+def _safe_filename(name: str) -> str:
+    # Keep only the filename, remove Windows-invalid characters and path parts.
+    name = Path(name).name
+    name = re.sub(r'[<>:"/\\|?*]', "_", name).strip(" .")
+    if not name:
+        name = "image.png"
+    if not name.lower().endswith(".png"):
+        name += ".png"
+    return name
+
+
+def generate_and_place_images(state: State) -> dict:
+    plan = state["plan"]
+    md = state.get("md_with_placeholders") or state["merged_md"]
+    image_specs = state.get("image_specs", [])[:3]
 
     output_dir = Path(__file__).resolve().parent / "output"
+    images_dir = output_dir / "images"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Remove characters Windows does not allow in filenames, including ":".
-    safe_title = re.sub(r'[<>:"/\\|?*]', "", plan.blog_title).strip().rstrip(". ")
-    output_path = output_dir / f"{safe_title or 'blog'}.md"
+    for spec in image_specs:
+        placeholder = spec["placeholder"]
+        filename = _safe_filename(spec["filename"])
+        image_path = images_dir / filename
 
-    written = output_path.write_text(final_md, encoding="utf-8")
-    print(f"Saved {written} characters to: {output_path.resolve()}")
+        try:
+            images_dir.mkdir(parents=True, exist_ok=True)
+            image_path.write_bytes(_openai_generate_image_bytes(spec))
 
-    return {"final": final_md}
+            image_markdown = (
+                f"![{spec['alt']}](images/{filename})\n\n"
+                f"*{spec['caption']}*"
+            )
+            md = md.replace(placeholder, image_markdown)
+
+        except Exception as error:
+            md = md.replace(
+                placeholder,
+                f"> Image unavailable: {spec.get('caption', '')} "
+                f"({error})",
+            )
+
+    # Remove any placeholders that were not replaced.
+    md = re.sub(r"\[\[IMAGE_\d+\]\]", "", md)
+
+    blog_name = re.sub(r'[<>:"/\\|?*]', "", plan.blog_title).strip()
+    blog_name = re.sub(r"\s+", "_", blog_name).strip(" ._") or "blog"
+    blog_path = output_dir / f"{blog_name}.md"
+
+    char_count = blog_path.write_text(md, encoding="utf-8")
+    print(f"Saved {char_count} characters to: {blog_path.resolve()}")
+
+    return {"final": md}
+
+# Build reducer subgraph
+reducer_graph = StateGraph(State)
+
+reducer_graph.add_node("merge_content", merge_content)
+reducer_graph.add_node("decide_images", decide_images)
+reducer_graph.add_node(
+    "generate_and_place_images",
+    generate_and_place_images,
+)
+
+reducer_graph.add_edge(START, "merge_content")
+reducer_graph.add_edge("merge_content", "decide_images")
+reducer_graph.add_edge("decide_images", "generate_and_place_images")
+reducer_graph.add_edge("generate_and_place_images", END)
+
+reducer_subgraph = reducer_graph.compile()
+
 
 #-----------------------------------------------------[ 9) Building Graph ]----------------------------------------------------------
 
 g = StateGraph(State)
+
 g.add_node("router", router_node)
 g.add_node("research", research_node)
 g.add_node("orchestrator", orchestrator_node)
 g.add_node("worker", worker_node)
-g.add_node("reducer", reducer_node)
+g.add_node("reducer", reducer_subgraph)
 
 g.add_edge(START, "router")
-g.add_conditional_edges("router", route_next, {"research": "research", "orchestrator": "orchestrator"})
+g.add_conditional_edges(
+    "router",
+    route_next,
+    {
+        "research": "research",
+        "orchestrator": "orchestrator",
+    },
+)
 g.add_edge("research", "orchestrator")
 
 g.add_conditional_edges("orchestrator", fanout, ["worker"])
@@ -382,26 +529,31 @@ g.add_edge("worker", "reducer")
 g.add_edge("reducer", END)
 
 app = g.compile()
-app
 
 # -------------------------------------------------------------[ 10) Runner ]---------------------------------------------------------
-def run(topic: str):
-    out = app.invoke(
-        {
-            "topic": topic,
-            "mode": "",
-            "needs_research": False,
-            "queries": [],
-            "evidence": [],
-            "plan": None,
-            "sections": [],
-            "final": "",
-        }
-    )
+# def run(topic: str, as_of: Optional[str] = None):
+#     if as_of is None:
+#         as_of = date.today().isoformat()
 
-    return out
+#     out = app.invoke(
+#         {
+#             "topic": topic,
+#             "mode": "",
+#             "needs_research": False,
+#             "queries": [],
+#             "evidence": [],
+#             "plan": None,
+#             "as_of": as_of,
+#             "recency_days": 7,
+#             "sections": [],
+#             "merged_md": "",
+#             "md_with_placeholders": "",
+#             "image_specs": [],
+#             "final": "",
+#         }
+#     )
+
+#     return out
 
 
-
-#run("Write a blog on Open Source LLMs in 2026")
-run("State of Multimodal LLMs in 2026")
+# run("Self Attention in Transformer Architecture")
