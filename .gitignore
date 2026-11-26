@@ -1,9 +1,15 @@
 # Secrets
 /.env
+.env.*
+!.env.example
 
-# Environment
+# Python environment
 /.venv
 __pycache__/
+*.pyc
 
-# OupPuts
+# Generated blogs and images
 /output
+
+# Backups
+*.bak
